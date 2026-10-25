@@ -90,6 +90,12 @@ pub struct WinitState {
     /// Currently handled seats.
     pub seats: AHashMap<ObjectId, WinitSeatState>,
 
+    pub tablet_manager: Option<super::seat::tablet::TabletManager>,
+    pub tablet_tools: AHashMap<
+        ObjectId,
+        sctk::reexports::protocols::wp::tablet::zv2::client::zwp_tablet_tool_v2::ZwpTabletToolV2,
+    >,
+
     /// Currently present cursor surfaces.
     pub pointer_surfaces: AHashMap<ObjectId, Arc<ThemedPointer<WinitPointerData>>>,
 
@@ -207,6 +213,7 @@ impl WinitState {
             primary_selection_manager_state,
         );
 
+        let tablet_manager = super::seat::tablet::TabletManager::new(globals, queue_handle).ok();
         let mut seats = AHashMap::default();
         for seat in seat_state.seats() {
             let data_device = data_device_manager_state
@@ -217,7 +224,10 @@ impl WinitState {
                 data_device.as_ref().map(|device| device.inner().clone()),
                 queue_handle,
             );
-            seats.insert(seat.id(), WinitSeatState::new(data_device));
+            let mut state = WinitSeatState::new(data_device);
+            state.tablet_seat =
+                tablet_manager.as_ref().map(|manager| manager.seat(&seat, queue_handle));
+            seats.insert(seat.id(), state);
         }
 
         let (viewporter_state, fractional_scaling_manager) =
@@ -253,6 +263,8 @@ impl WinitState {
             kwin_blur_manager: KWinBlurManager::new(globals, queue_handle).ok(),
 
             seats,
+            tablet_manager,
+            tablet_tools: Default::default(),
             text_input_state: TextInputState::new(globals, queue_handle).ok(),
 
             relative_pointer: RelativePointerState::new(globals, queue_handle).ok(),

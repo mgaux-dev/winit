@@ -25,6 +25,7 @@ use crate::platform_impl::wayland::WindowId;
 mod dnd;
 mod keyboard;
 mod pointer;
+pub(crate) mod tablet;
 mod text_input;
 mod touch;
 
@@ -68,6 +69,9 @@ pub struct WinitSeatState {
 
     /// The data device bound on the seat, which receives file drags.
     data_device: Option<DataDevice>,
+    pub(crate) tablet_seat: Option<
+        sctk::reexports::protocols::wp::tablet::zv2::client::zwp_tablet_seat_v2::ZwpTabletSeatV2,
+    >,
 
     /// The file drag over one of our windows.
     file_drag: Option<dnd::FileDrag>,
@@ -229,7 +233,10 @@ impl SeatHandler for WinitState {
             data_device.as_ref().map(|device| device.inner().clone()),
             queue_handle,
         );
-        self.seats.insert(seat.id(), WinitSeatState::new(data_device));
+        let mut state = WinitSeatState::new(data_device);
+        state.tablet_seat =
+            self.tablet_manager.as_ref().map(|manager| manager.seat(&seat, queue_handle));
+        self.seats.insert(seat.id(), state);
     }
 
     fn remove_seat(
@@ -242,8 +249,15 @@ impl SeatHandler for WinitState {
         // input is destroyed only here, when the seat itself goes away.
         self.cancel_file_drag(&seat.id());
         self.clipboard.remove_seat(&seat.id());
-        let removed_text_input =
-            self.seats.remove(&seat.id()).and_then(|mut seat| seat.text_input.take());
+        self.remove_tablet_seat(&seat);
+        let mut removed = self.seats.remove(&seat.id());
+        if let Some(tablet_seat) = removed.as_mut().and_then(|seat| seat.tablet_seat.take()) {
+            if let Some(data) = tablet_seat.data::<tablet::SeatData>() {
+                data.destroy_objects();
+            }
+            tablet_seat.destroy();
+        }
+        let removed_text_input = removed.and_then(|mut seat| seat.text_input.take());
         if let Some(text_input) = removed_text_input {
             // Detach the proxy from every window that still listed it *before* sampling whether
             // it was active. A worker `set_ime_allowed` takes a window lock first, so removing it

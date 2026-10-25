@@ -352,6 +352,37 @@ pub struct ImeDeleteSurrounding {
     pub after_bytes: usize,
 }
 
+/// Native tablet touch IDs are distinct from wl_touch contact IDs.
+pub const TABLET_TOUCH_TAG: u64 = 1 << 63;
+
+/// A native tablet phase on one Wayland window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TabletPhase {
+    Entered,
+    Moved,
+    Pressed,
+    Released,
+    Left,
+}
+/// A coherent tablet-v2 frame sample. Position is in physical window pixels; angles are degrees.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TabletInput {
+    /// Connection-local tool identifier, valid for the tool's lifetime.
+    pub tool_id: u64,
+    /// Hover, contact or proximity transition.
+    pub phase: TabletPhase,
+    /// Pointer position relative to this window.
+    pub position: crate::dpi::PhysicalPosition<f64>,
+    /// Pressure in 0..=1.
+    pub pressure: f64,
+    /// X/Y tilt in -90..=90 degrees.
+    pub tilt: [f64; 2],
+    /// Barrel rotation in 0..360 degrees.
+    pub rotation: f64,
+    /// The tool is the pen's eraser end.
+    pub eraser: bool,
+}
+
 /// Additional methods on [`Window`] that are specific to Wayland.
 ///
 /// This fork adds required surrounding-text methods without default no-op implementations. That
@@ -365,6 +396,10 @@ pub struct ImeDeleteSurrounding {
 pub trait WindowExtWayland {
     /// Returns `xdg_toplevel` of the window or [`None`] if the window is X11 window.
     fn xdg_toplevel(&self) -> Option<NonNull<c_void>>;
+    /// Drain bounded tablet-v2 samples for this window. X11 returns an empty list.
+    fn take_tablet_input(&self) -> Vec<TabletInput>;
+    /// Whether the compositor advertised tablet-v2 when this Wayland window was created.
+    fn tablet_input_available(&self) -> bool;
     /// Tells the input method the text around the cursor of the focused text field, so it can
     /// base suggestions and corrections on it (text-input-v3 surrounding text).
     ///
@@ -438,6 +473,22 @@ pub trait WindowExtWayland {
 }
 
 impl WindowExtWayland for Window {
+    fn take_tablet_input(&self) -> Vec<TabletInput> {
+        match &self.window {
+            #[cfg(x11_platform)]
+            crate::platform_impl::Window::X(_) => Vec::new(),
+            #[cfg(wayland_platform)]
+            crate::platform_impl::Window::Wayland(window) => window.take_tablet_input(),
+        }
+    }
+    fn tablet_input_available(&self) -> bool {
+        match &self.window {
+            #[cfg(x11_platform)]
+            crate::platform_impl::Window::X(_) => false,
+            #[cfg(wayland_platform)]
+            crate::platform_impl::Window::Wayland(window) => window.tablet_input_available(),
+        }
+    }
     fn set_ime_surrounding_text_with_change_cause(
         &self,
         text: &str,

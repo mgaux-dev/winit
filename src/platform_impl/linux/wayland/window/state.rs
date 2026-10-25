@@ -158,6 +158,11 @@ impl<K: Clone + PartialEq> ImePreeditOwnership<K> {
 
 /// The state of the window which is being updated from the [`WinitState`].
 pub struct WindowState {
+    /// Bounded per-window tablet samples; protocol reception remains event-loop-owned.
+    tablet_input: std::collections::VecDeque<crate::platform::wayland::TabletInput>,
+    tablet_cursors: Vec<Weak<Mutex<super::super::seat::tablet::TabletCursor>>>,
+    pub tablet_input_available: bool,
+    pub tablet_grab: Option<(u64, sctk::reexports::client::protocol::wl_seat::WlSeat, u32)>,
     /// The connection to Wayland server.
     pub connection: Connection,
 
@@ -283,6 +288,16 @@ pub struct WindowState {
 }
 
 impl WindowState {
+    pub fn push_tablet_input(&mut self, sample: crate::platform::wayland::TabletInput) {
+        if self.tablet_input.len() >= 2048 {
+            self.tablet_input.pop_front();
+        }
+        self.tablet_input.push_back(sample);
+    }
+    pub fn take_tablet_input(&mut self) -> Vec<crate::platform::wayland::TabletInput> {
+        self.tablet_input.drain(..).collect()
+    }
+
     /// Create new window state.
     pub fn new(
         connection: Connection,
@@ -304,6 +319,10 @@ impl WindowState {
             .map(|fsm| fsm.fractional_scaling(window.wl_surface(), queue_handle));
 
         Self {
+            tablet_input: Default::default(),
+            tablet_cursors: Vec::new(),
+            tablet_grab: None,
+            tablet_input_available: winit_state.tablet_manager.is_some(),
             blur: None,
             blur_manager: winit_state.kwin_blur_manager.clone(),
             compositor,
@@ -556,6 +575,11 @@ impl WindowState {
     pub fn drag_resize_window(&self, direction: ResizeDirection) -> Result<(), ExternalError> {
         let xdg_toplevel = self.window.xdg_toplevel();
 
+        // Tablet down serials authorize moves/resizes just like pointer button serials.
+        if let Some((_, seat, serial)) = &self.tablet_grab {
+            xdg_toplevel.resize(seat, *serial, direction.into());
+            return Ok(());
+        }
         // TODO(kchibisov) handle touch serials.
         self.apply_on_pointer(|_, data| {
             let serial = data.latest_button_serial();
@@ -569,6 +593,10 @@ impl WindowState {
     /// Start the window drag.
     pub fn drag_window(&self) -> Result<(), ExternalError> {
         let xdg_toplevel = self.window.xdg_toplevel();
+        if let Some((_, seat, serial)) = &self.tablet_grab {
+            xdg_toplevel._move(seat, *serial);
+            return Ok(());
+        }
         // TODO(kchibisov) handle touch serials.
         self.apply_on_pointer(|_, data| {
             let serial = data.latest_button_serial();
@@ -767,6 +795,18 @@ impl WindowState {
     }
 
     /// Reload the cursor style on the given window.
+    pub(crate) fn enter_tablet_cursor(
+        &mut self,
+        cursor: &Arc<Mutex<super::super::seat::tablet::TabletCursor>>,
+    ) {
+        cursor.lock().unwrap_or_else(std::sync::PoisonError::into_inner).window_id =
+            Some(super::super::make_wid(self.window.wl_surface()));
+        self.tablet_cursors.retain(|weak| weak.strong_count() > 0);
+        if !self.tablet_cursors.iter().any(|weak| weak.ptr_eq(&Arc::downgrade(cursor))) {
+            self.tablet_cursors.push(Arc::downgrade(cursor));
+        }
+        self.reload_cursor_style();
+    }
     pub fn reload_cursor_style(&mut self) {
         if self.cursor_visible {
             match &self.selected_cursor {
@@ -857,6 +897,12 @@ impl WindowState {
             return;
         }
 
+        for cursor in self.tablet_cursors.iter().filter_map(Weak::upgrade) {
+            let mut cursor = cursor.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if cursor.window_id == Some(super::super::make_wid(self.window.wl_surface())) {
+                cursor.named(cursor_icon, self.scale_factor());
+            }
+        }
         self.apply_on_pointer(|pointer, _| {
             if pointer.set_cursor(&self.connection, cursor_icon).is_err() {
                 warn!("Failed to set cursor to {:?}", cursor_icon);
@@ -900,6 +946,20 @@ impl WindowState {
     }
 
     fn apply_custom_cursor(&self, cursor: &CustomCursor) {
+        for tablet in self.tablet_cursors.iter().filter_map(Weak::upgrade) {
+            let mut tablet = tablet.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if tablet.window_id != Some(super::super::make_wid(self.window.wl_surface())) {
+                continue;
+            }
+            tablet.custom(
+                cursor.buffer.wl_buffer(),
+                cursor.w,
+                cursor.h,
+                cursor.hotspot_x,
+                cursor.hotspot_y,
+                self.scale_factor(),
+            );
+        }
         self.apply_on_pointer(|pointer, data| {
             let surface = pointer.surface();
 
@@ -1056,6 +1116,10 @@ impl WindowState {
     }
 
     pub fn show_window_menu(&self, position: LogicalPosition<u32>) {
+        if let Some((_, seat, serial)) = &self.tablet_grab {
+            self.window.show_window_menu(seat, *serial, position.into());
+            return;
+        }
         // TODO(kchibisov) handle touch serials.
         self.apply_on_pointer(|_, data| {
             let serial = data.latest_button_serial();
@@ -1094,6 +1158,12 @@ impl WindowState {
                 SelectedCursor::Custom(cursor) => self.apply_custom_cursor(cursor),
             }
         } else {
+            for cursor in self.tablet_cursors.iter().filter_map(Weak::upgrade) {
+                let mut cursor = cursor.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                if cursor.window_id == Some(super::super::make_wid(self.window.wl_surface())) {
+                    cursor.hide();
+                }
+            }
             for pointer in self.pointers.iter().filter_map(|pointer| pointer.upgrade()) {
                 let latest_enter_serial = pointer.pointer().winit_data().latest_enter_serial();
 

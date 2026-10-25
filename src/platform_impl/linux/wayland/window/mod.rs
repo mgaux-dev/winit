@@ -691,6 +691,19 @@ impl Window {
     }
 
     #[inline]
+    pub fn take_tablet_input(&self) -> Vec<crate::platform::wayland::TabletInput> {
+        self.window_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take_tablet_input()
+    }
+    pub fn tablet_input_available(&self) -> bool {
+        self.window_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .tablet_input_available
+    }
+
     pub fn take_ime_delete_surrounding(
         &self,
     ) -> Option<crate::platform::wayland::ImeDeleteSurrounding> {
