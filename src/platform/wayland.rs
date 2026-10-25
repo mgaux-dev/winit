@@ -352,7 +352,7 @@ pub struct ImeDeleteSurrounding {
     pub after_bytes: usize,
 }
 
-/// Native tablet touch IDs are distinct from wl_touch contact IDs.
+/// Set in every [`TabletInput::tool_id`], so a tool id never equals a wl_touch contact id.
 pub const TABLET_TOUCH_TAG: u64 = 1 << 63;
 
 /// A native tablet phase on one Wayland window.

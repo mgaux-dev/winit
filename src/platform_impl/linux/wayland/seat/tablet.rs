@@ -1,9 +1,10 @@
 //! Tablet-v2 reception on the window event loop's connection.
 //!
 //! Adapts the event/frame routing in upstream winit's wp_tablet_input_v2 (Apache-2.0)
-//! to the 0.30 Touch/pointer API. Per-window samples retain the axes that 0.30 drops.
+//! to the 0.30 pointer API: the pen is a mouse whose tip is the left button. Per-window samples
+//! retain the axes that 0.30 drops.
 use crate::dpi::LogicalPosition;
-use crate::event::{ElementState, Force, MouseButton, Touch, TouchPhase, WindowEvent};
+use crate::event::{ElementState, MouseButton, WindowEvent};
 use crate::platform::wayland::{TabletInput, TabletPhase};
 use crate::platform_impl::wayland::state::WinitState;
 use crate::platform_impl::wayland::{self, DeviceId};
@@ -202,42 +203,34 @@ impl WinitState {
         }
         window.push_tablet_input(sample);
         drop(window);
+        // The pen is a mouse to the app, as on X11: hovering moves the cursor and the tip is the
+        // left button. Reported as touch, toolkits would take it for a finger: egui, having seen
+        // one touch, treats the machine as a touch screen and scrolls on every drag instead of
+        // selecting or drawing. The pressure is in the samples above.
         let device_id = crate::event::DeviceId(crate::platform_impl::DeviceId::Wayland(DeviceId));
-        let touch_phase = match phase {
-            TabletPhase::Pressed => Some(TouchPhase::Started),
-            TabletPhase::Moved if tool.down => Some(TouchPhase::Moved),
-            TabletPhase::Released => Some(TouchPhase::Ended),
-            TabletPhase::Left if tool.down => Some(TouchPhase::Cancelled),
-            _ => None,
-        };
-        if let Some(phase) = touch_phase {
-            self.events_sink.push_window_event(
-                WindowEvent::Touch(Touch {
-                    device_id,
-                    phase,
-                    location: position,
-                    force: Some(Force::Normalized(tool.pressure)),
-                    id: tool_id,
-                }),
-                window_id,
-            );
-        } else {
-            match phase {
-                TabletPhase::Entered => self
-                    .events_sink
-                    .push_window_event(WindowEvent::CursorEntered { device_id }, window_id),
-                TabletPhase::Moved => self
-                    .events_sink
-                    .push_window_event(WindowEvent::CursorMoved { device_id, position }, window_id),
-                TabletPhase::Left => self
-                    .events_sink
-                    .push_window_event(WindowEvent::CursorLeft { device_id }, window_id),
-                _ => {},
-            }
-        }
-        // Touch-cancel releases the contact; the hover must also leave the same surface.
-        if phase == TabletPhase::Left && tool.down {
-            self.events_sink.push_window_event(WindowEvent::CursorLeft { device_id }, window_id);
+        let left = |state| WindowEvent::MouseInput { device_id, state, button: MouseButton::Left };
+        let moved = WindowEvent::CursorMoved { device_id, position };
+        let sink = &mut self.events_sink;
+        match phase {
+            TabletPhase::Entered => {
+                sink.push_window_event(WindowEvent::CursorEntered { device_id }, window_id)
+            },
+            TabletPhase::Moved => sink.push_window_event(moved, window_id),
+            // The position goes first, so the tip presses and lifts where it touched.
+            TabletPhase::Pressed => {
+                sink.push_window_event(moved, window_id);
+                sink.push_window_event(left(ElementState::Pressed), window_id);
+            },
+            TabletPhase::Released => {
+                sink.push_window_event(moved, window_id);
+                sink.push_window_event(left(ElementState::Released), window_id);
+            },
+            TabletPhase::Left => {
+                if tool.down {
+                    sink.push_window_event(left(ElementState::Released), window_id);
+                }
+                sink.push_window_event(WindowEvent::CursorLeft { device_id }, window_id);
+            },
         }
         self.dispatched_events = true;
     }
@@ -611,10 +604,10 @@ impl TabletCursor {
             return;
         };
         let connection = Connection::from_backend(backend);
-        let scale = scale.ceil().clamp(1.0, 8.0) as i32;
+        let max_scale = cursor_scale(scale);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            if self.theme.is_none() || self.theme_scale != scale {
-                self.theme_scale = scale;
+            if self.theme.is_none() || self.theme_scale != max_scale {
+                self.theme_scale = max_scale;
                 let name = std::env::var("XCURSOR_THEME")
                     .ok()
                     .filter(|name| name.len() <= 1024)
@@ -623,7 +616,7 @@ impl TabletCursor {
                     &connection,
                     self.shm.clone(),
                     &name,
-                    24 * scale as u32,
+                    24 * max_scale as u32,
                 )
                 .ok();
             }
@@ -642,6 +635,7 @@ impl TabletCursor {
             let image = &cursor[0];
             let (w, h) = image.dimensions();
             let (x, y) = image.hotspot();
+            let scale = fit_buffer_scale(w, h, max_scale);
             // Named cursor images are logical-size assets, independent of output scaling.
             self.surface.set_buffer_scale(scale);
             self.surface.attach(Some(image), 0, 0);
@@ -686,7 +680,11 @@ impl TabletCursor {
         let Ok(tool) = self.tool.upgrade() else {
             return;
         };
-        let scale = scale.ceil().clamp(1.0, 8.0) as i32;
+        let scale = fit_buffer_scale(
+            u32::try_from(w).unwrap_or(0),
+            u32::try_from(h).unwrap_or(0),
+            cursor_scale(scale),
+        );
         self.surface.set_buffer_scale(scale);
         self.surface.attach(Some(buffer), 0, 0);
         self.surface.damage(0, 0, w / scale + 1, h / scale + 1);
@@ -694,10 +692,55 @@ impl TabletCursor {
         tool.set_cursor(self.serial, Some(&self.surface), x / scale, y / scale);
     }
 }
+/// The window's scale factor rounded up to a whole buffer scale, 1 to 8.
+fn cursor_scale(scale_factor: f64) -> i32 {
+    if scale_factor.is_finite() {
+        scale_factor.ceil().clamp(1.0, 8.0) as i32
+    } else {
+        1
+    }
+}
+
+/// The largest buffer scale up to `max_scale` that divides the image. A buffer whose size is
+/// not a multiple of its scale is a protocol error, which would end the connection.
+fn fit_buffer_scale(width: u32, height: u32, max_scale: i32) -> i32 {
+    (1..=max_scale.max(1))
+        .rev()
+        .find(|&scale| {
+            let scale = scale.unsigned_abs();
+            width % scale == 0 && height % scale == 0
+        })
+        .unwrap_or(1)
+}
+
 impl Drop for TabletCursor {
     fn drop(&mut self) {
         if self.surface.is_alive() {
             self.surface.destroy();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{cursor_scale, fit_buffer_scale};
+
+    #[test]
+    fn cursor_scale_is_a_whole_scale_from_1_to_8() {
+        assert_eq!(cursor_scale(1.0), 1);
+        assert_eq!(cursor_scale(1.25), 2);
+        assert_eq!(cursor_scale(100.0), 8);
+        assert_eq!(cursor_scale(0.0), 1);
+        assert_eq!(cursor_scale(f64::NAN), 1);
+        assert_eq!(cursor_scale(f64::INFINITY), 1);
+    }
+
+    #[test]
+    fn buffer_scale_divides_the_image() {
+        assert_eq!(fit_buffer_scale(48, 48, 2), 2);
+        assert_eq!(fit_buffer_scale(64, 64, 3), 2);
+        assert_eq!(fit_buffer_scale(33, 32, 2), 1);
+        assert_eq!(fit_buffer_scale(0, 0, 2), 2);
+        assert_eq!(fit_buffer_scale(24, 24, 0), 1);
     }
 }
